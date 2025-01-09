@@ -15,6 +15,7 @@ const UserSchema = new Schema({
   level: { type: Number, default: 1 },  // Current user level
   xpNeededForNextLevel: { type: Number, default: 100 },
   streak: { type: Number, default: 0 },
+  refreshToken: { type: String, select: false },  // New field for storing refresh token
 
   // Track lesson progress by section
   progress: [
@@ -79,6 +80,12 @@ UserSchema.methods.addXP = function (xpEarned) {
   if (xpEarned <= 0) return;
   this.totalXp += xpEarned;
   this.calculateLevel();
+};
+
+// Clear refresh token on logout
+UserSchema.methods.clearRefreshToken = async function () {
+  this.refreshToken = '';
+  await this.save();
 };
 
 // Mark a lesson as completed and unlock N+1 lessons

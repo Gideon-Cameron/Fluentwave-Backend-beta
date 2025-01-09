@@ -2,10 +2,9 @@ const express = require('express');
 const multer = require('multer');
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
-const Lesson = require('../models/Lesson');
 const BlacklistedToken = require('../models/BlacklistedToken');
 const { authenticateUser } = require('../middleware/auth');
-const mongoose = require('mongoose');
+const { generateAccessToken, generateRefreshToken } = require('../utils/tokenUtils');
 
 const router = express.Router();
 
@@ -29,129 +28,29 @@ const upload = multer({
   },
 });
 
-// Helper function to generate JWT
-const generateToken = (id) => {
-  return jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '1h' });
+// Helper function to send tokens and set cookie
+const sendTokenResponse = (user, res) => {
+  const accessToken = generateAccessToken(user._id);
+  const refreshToken = generateRefreshToken(user._id);
+
+  // Store refresh token in the user model
+  user.refreshToken = refreshToken;
+  user.save();
+
+  // Set HTTP-only cookie for refresh token
+  res.cookie('refreshToken', refreshToken, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'Strict',
+    maxAge: 30 * 24 * 60 * 60 * 1000,  // 30 days
+  });
+
+  res.status(200).json({
+    success: true,
+    accessToken,
+    data: { id: user._id, name: user.name, email: user.email },
+  });
 };
-
-// Calculate user level dynamically
-const calculateLevel = (totalXp) => {
-  let level = 1;
-  let xpForNextLevel = 100;
-  let remainingXP = totalXp;
-
-  while (remainingXP >= xpForNextLevel) {
-    remainingXP -= xpForNextLevel;
-    level++;
-    xpForNextLevel += 50;
-  }
-
-  return { level, xp: remainingXP, xpNeededForNextLevel: xpForNextLevel };
-};
-
-// GET /api/users/profile
-router.get('/profile', authenticateUser, async (req, res) => {
-  try {
-    const user = await User.findById(req.user?._id).select('-password');
-    if (!user) {
-      return res.status(404).json({ success: false, error: 'User not found' });
-    }
-
-    const totalXp = user.totalXp || 0;
-    const levelInfo = calculateLevel(totalXp);
-
-    const completedLessons = user.progress
-      .filter((lesson) => lesson.completed)
-      .map((l) => l.lessonId);
-
-    res.status(200).json({
-      success: true,
-      data: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        avatar: user.avatar,
-        totalXp,
-        level: levelInfo.level,
-        xp: levelInfo.xp,
-        xpNeededForNextLevel: levelInfo.xpNeededForNextLevel,
-        streak: user.streak,
-        completedLessons,
-        progress: user.progress,
-        achievements: user.achievements || [],
-      },
-    });
-  } catch (error) {
-    console.error('Error fetching profile:', error.message);
-    res.status(500).json({ success: false, error: 'Server error. Could not fetch user profile.' });
-  }
-});
-
-// GET /api/users/leaderboard
-router.get('/leaderboard', async (req, res) => {
-  try {
-    const topUsers = await User.find({}, 'name avatar xp totalXp level')
-      .sort({ totalXp: -1 })
-      .limit(50);
-    const leaderboard = topUsers.map((user, index) => {
-      const levelInfo = calculateLevel(user.totalXp || 0);
-      return {
-        rank: index + 1,
-        id: user._id,
-        name: user.name,
-        avatar: user.avatar,
-        xp: levelInfo.xp,
-        level: levelInfo.level,
-      };
-    });
-
-    res.status(200).json({ success: true, data: leaderboard });
-  } catch (error) {
-    console.error('Error fetching leaderboard:', error.message);
-    res.status(500).json({ success: false, error: 'Server error. Could not fetch leaderboard.' });
-  }
-});
-
-// POST /api/users/add-xp
-router.post('/add-xp', authenticateUser, async (req, res) => {
-  const { xpEarned, lessonId } = req.body;
-
-  if (!xpEarned || xpEarned <= 0) {
-    return res.status(400).json({ success: false, error: 'XP must be greater than zero.' });
-  }
-
-  try {
-    const user = await User.findById(req.user._id);
-    if (!user) {
-      return res.status(404).json({ success: false, error: 'User not found' });
-    }
-
-    user.addXP(xpEarned);
-
-    if (lessonId) {
-      await user.completeLesson(lessonId);
-    }
-
-    await user.save();
-
-    const levelInfo = calculateLevel(user.totalXp);
-
-    res.status(200).json({
-      success: true,
-      message: 'XP added successfully. Lesson marked as completed.',
-      data: {
-        level: levelInfo.level,
-        xp: levelInfo.xp,
-        xpNeededForNextLevel: levelInfo.xpNeededForNextLevel,
-        totalXp: user.totalXp,
-        progress: user.progress,
-      },
-    });
-  } catch (error) {
-    console.error('Error adding XP:', error.message);
-    res.status(500).json({ success: false, error: 'Server error. Could not add XP.' });
-  }
-});
 
 // POST /api/users/register
 router.post('/register', async (req, res) => {
@@ -165,13 +64,8 @@ router.post('/register', async (req, res) => {
 
     const newUser = new User({ name, email, password });
     const savedUser = await newUser.save();
-    const token = generateToken(savedUser._id);
 
-    res.status(201).json({
-      success: true,
-      token,
-      data: { id: savedUser._id, name: savedUser.name, email: savedUser.email },
-    });
+    sendTokenResponse(savedUser, res);
   } catch (error) {
     console.error('Error registering user:', error.message);
     res.status(500).json({ success: false, error: 'Server error. Could not register user.' });
@@ -188,12 +82,94 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Invalid credentials' });
     }
 
-    const token = generateToken(user._id);
-
-    res.status(200).json({ success: true, token, data: { id: user._id, name: user.name, email: user.email } });
+    sendTokenResponse(user, res);
   } catch (error) {
     console.error('Error during login:', error.message);
     res.status(500).json({ success: false, error: 'Server error. Could not log in.' });
+  }
+});
+
+// POST /api/users/logout
+router.post('/logout', authenticateUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id);
+    user.refreshToken = '';
+    await user.save();
+
+    res.clearCookie('refreshToken');
+
+    res.status(200).json({ success: true, message: 'Logged out successfully' });
+  } catch (error) {
+    console.error('Error during logout:', error.message);
+    res.status(500).json({ success: false, error: 'Could not log out.' });
+  }
+});
+
+// POST /api/users/refresh - Refresh Access Token
+router.post('/refresh', async (req, res) => {
+  const refreshToken = req.cookies.refreshToken;
+
+  if (!refreshToken) {
+    return res.status(401).json({ success: false, error: 'No refresh token provided' });
+  }
+
+  try {
+    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+    const user = await User.findById(decoded.id);
+
+    if (!user || user.refreshToken !== refreshToken) {
+      return res.status(403).json({ success: false, error: 'Invalid refresh token' });
+    }
+
+    // Generate new access token and refresh token (token rotation)
+    const accessToken = generateAccessToken(user._id);
+    const newRefreshToken = generateRefreshToken(user._id);
+
+    // Update refresh token in user record
+    user.refreshToken = newRefreshToken;
+    await user.save();
+
+    // Update cookie with new refresh token
+    res.cookie('refreshToken', newRefreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'Strict',
+      maxAge: 30 * 24 * 60 * 60 * 1000,
+    });
+
+    res.status(200).json({ success: true, accessToken });
+  } catch (error) {
+    console.error('Refresh token error:', error.message);
+    res.status(403).json({ success: false, error: 'Token expired or invalid' });
+  }
+});
+
+// GET /api/users/profile (Protected Route)
+router.get('/profile', authenticateUser, async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id).select('-password');
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    res.status(200).json({ success: true, data: user });
+  } catch (error) {
+    console.error('Error fetching profile:', error.message);
+    res.status(500).json({ success: false, error: 'Server error. Could not fetch user profile.' });
+  }
+});
+
+// GET /api/users/leaderboard
+router.get('/leaderboard', async (req, res) => {
+  try {
+    const topUsers = await User.find({}, 'name avatar totalXp level')
+      .sort({ totalXp: -1 })
+      .limit(50);
+
+    res.status(200).json({ success: true, data: topUsers });
+  } catch (error) {
+    console.error('Error fetching leaderboard:', error.message);
+    res.status(500).json({ success: false, error: 'Server error. Could not fetch leaderboard.' });
   }
 });
 

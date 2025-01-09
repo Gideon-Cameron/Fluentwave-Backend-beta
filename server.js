@@ -2,9 +2,12 @@ require('dotenv').config(); // Load environment variables
 const express = require('express');
 const mongoose = require('mongoose');
 const bodyParser = require('body-parser');
+const cookieParser = require('cookie-parser');  // Import cookie parser for refresh token
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+
+const app = express();
 
 // Ensure uploads directory exists
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -13,16 +16,19 @@ if (!fs.existsSync(uploadsDir)) {
   console.log('Uploads directory created at', uploadsDir);
 }
 
-const app = express();
-
 // Middleware
-app.use(cors({ origin: ['http://localhost:3000', 'https://fluentwave-beta.netlify.app'] })); // Adjust origin based on frontend deployment
+app.use(
+  cors({
+    origin: ['http://localhost:3000', 'https://fluentwave-beta.netlify.app'],
+    credentials: true,  // Allow cookies to be sent from frontend
+  })
+);
 app.use(bodyParser.json());
+app.use(cookieParser());  // Parse incoming cookies
 app.use('/uploads', express.static(uploadsDir));
 
-// MongoDB connection URI from .env
+// MongoDB connection
 const dbURI = process.env.MONGO_URI;
-
 mongoose
   .connect(dbURI, { useNewUrlParser: true, useUnifiedTopology: true })
   .then(() => console.log('MongoDB connected...'))
@@ -31,9 +37,9 @@ mongoose
     process.exit(1); // Exit if DB connection fails
   });
 
-// Authentication Middleware
-const { authenticateUser } = require('./middleware/auth'); 
-const BlacklistedToken = require('./models/BlacklistedToken'); // Import BlacklistedToken model
+// Import Middleware and Models
+const { authenticateUser } = require('./middleware/auth');
+const BlacklistedToken = require('./models/BlacklistedToken');
 
 // Routes
 const lessonRoutes = require('./routes/lessons');
@@ -78,21 +84,59 @@ app.get('/api/protected', authenticateUser, (req, res) => {
   res.json({ message: 'This is a protected route', user: req.user });
 });
 
-// Logout Route (Token Blacklist)
+// Logout Route - Clear Cookie and Blacklist Token
 app.post('/api/users/logout', authenticateUser, async (req, res) => {
   try {
-    const token = req.header('Authorization').split(' ')[1]; // Extract token
-    if (!token) {
-      return res.status(400).json({ error: 'No token provided' });
+    const token = req.header('Authorization')?.split(' ')[1];
+    const refreshToken = req.cookies.refreshToken;
+
+    if (!token && !refreshToken) {
+      return res.status(400).json({ error: 'No tokens provided' });
     }
 
-    // Add token to blacklist
-    await BlacklistedToken.create({ token });
+    if (token) {
+      await BlacklistedToken.create({ token });
+    }
+
+    // Clear refresh token cookie
+    res.clearCookie('refreshToken', {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'Strict',
+    });
 
     res.status(200).json({ message: 'Successfully logged out' });
   } catch (error) {
     console.error('Logout error:', error.message);
     res.status(500).json({ error: 'Internal server error during logout' });
+  }
+});
+
+// Refresh Token Route - Issue New Access Token
+app.post('/api/users/refresh', async (req, res) => {
+  const refreshToken = req.cookies.refreshToken;
+  if (!refreshToken) {
+    return res.status(401).json({ error: 'No refresh token provided' });
+  }
+
+  try {
+    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+    const user = await User.findById(decoded.id);
+
+    if (!user || user.refreshToken !== refreshToken) {
+      return res.status(403).json({ error: 'Invalid refresh token' });
+    }
+
+    const newAccessToken = jwt.sign(
+      { id: user._id },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+
+    res.status(200).json({ accessToken: newAccessToken });
+  } catch (error) {
+    console.error('Refresh token error:', error.message);
+    res.status(403).json({ error: 'Refresh token expired or invalid' });
   }
 });
 
